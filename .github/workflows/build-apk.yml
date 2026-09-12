@@ -40,7 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --tags --force
-          latest_release="$(gh release list --limit 1 --json tagName,name --jq '.[0].tagName' || true)"
+          latest_release="$(gh release list --limit 1 --json tagName,name --jq '.[0].tagName // empty' || true)"
 
           publish=false
           source_ref="${GITHUB_SHA}"

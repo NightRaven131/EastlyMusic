@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build/publish. Blank = build latest release source as a non-release artifact."
+        description: "Existing release tag to build from (its attached source .zip is used). Blank = use the latest release."
         required: false
         type: string
       title:
@@ -25,12 +25,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Initial checkout for metadata
+      - name: Checkout repository
         uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
 
-      - name: Resolve build source, version, and release policy
+      - name: Resolve source release, version, and release policy
         id: meta
         env:
           INPUT_TAG: ${{ inputs.tag }}
@@ -39,41 +37,41 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git fetch --tags --force
-          latest_release="$(gh release list --limit 1 --json tagName,name --jq '.[0].tagName // empty' || true)"
+          latest_release="$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 1 --json tagName --jq '.[0].tagName // empty' || true)"
 
           publish=false
-          source_ref="${GITHUB_SHA}"
+          source_tag=""
           target_tag=""
 
           if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
-            source_ref="${GITHUB_REF_NAME}"
             target_tag="${GITHUB_REF_NAME}"
+            source_tag="${target_tag}"
             publish=true
           elif [[ -n "${INPUT_TAG}" ]]; then
             target_tag="${INPUT_TAG#refs/tags/}"
             [[ "${target_tag}" == v* ]] || target_tag="v${target_tag}"
-            git rev-parse --verify "refs/tags/${target_tag}" >/dev/null 2>&1 || { echo "Requested tag ${target_tag} does not exist." >&2; exit 1; }
-            source_ref="${target_tag}"
+            source_tag="${target_tag}"
             publish=true
-          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${latest_release}" ]]; then
-            source_ref="${latest_release}"
+          elif [[ -n "${latest_release}" ]]; then
+            source_tag="${latest_release}"
+          else
+            echo "No release exists yet. Create a release with a source .zip asset attached, then run this workflow again." >&2
+            exit 1
           fi
+
+          gh release view "${source_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 || {
+            echo "Release '${source_tag}' was not found." >&2
+            exit 1
+          }
 
           if [[ -n "${target_tag}" ]]; then
             version_name="${target_tag#v}"
-          elif [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_TYPE}" == "branch" ]]; then
-            base="${latest_release#v}"
-            [[ -n "${base}" ]] || base="0.0.0"
-            version_name="${base}-main.${GITHUB_RUN_NUMBER}"
-          elif [[ -n "${latest_release}" ]]; then
-            version_name="${latest_release#v}-rebuild.${GITHUB_RUN_NUMBER}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            version_name="${source_tag#v}-main.${GITHUB_RUN_NUMBER}"
           else
-            version_name="0.0.0-dev.${GITHUB_RUN_NUMBER}"
+            version_name="${source_tag#v}-rebuild.${GITHUB_RUN_NUMBER}"
           fi
 
-          # CI run numbers are globally monotonic within this repository. The low digit
-          # identifies build kind while the run number guarantees unique Android versionCode values.
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             channel=9
           elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
@@ -94,7 +92,7 @@ jobs:
           [[ -n "${release_title}" ]] || release_title="Eastly ${version_name}"
 
           {
-            echo "source_ref=${source_ref}"
+            echo "source_tag=${source_tag}"
             echo "release_tag=${target_tag}"
             echo "version_name=${version_name}"
             echo "version_code=${version_code}"
@@ -104,11 +102,51 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Checkout resolved build source
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ steps.meta.outputs.source_ref }}
-          fetch-depth: 0
+      - name: Download and extract source from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ steps.meta.outputs.source_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          download_dir="$(mktemp -d)"
+          if ! gh release download "${SOURCE_TAG}" --repo "${GITHUB_REPOSITORY}" --pattern "*.zip" --dir "${download_dir}"; then
+            echo "Could not find a .zip asset on release '${SOURCE_TAG}'. Attach the project source as a .zip to that release and try again." >&2
+            exit 1
+          fi
+
+          shopt -s nullglob
+          zips=("${download_dir}"/*.zip)
+          shopt -u nullglob
+
+          if [[ ${#zips[@]} -eq 0 ]]; then
+            echo "Release '${SOURCE_TAG}' has no .zip asset attached. Attach the project source as a .zip to that release and try again." >&2
+            exit 1
+          fi
+          if [[ ${#zips[@]} -gt 1 ]]; then
+            echo "Release '${SOURCE_TAG}' has more than one .zip asset. Keep exactly one so the build knows which to use:" >&2
+            printf ' - %s\n' "${zips[@]##*/}" >&2
+            exit 1
+          fi
+
+          extract_dir="$(mktemp -d)"
+          unzip -q "${zips[0]}" -d "${extract_dir}"
+
+          shopt -s nullglob dotglob
+          entries=("${extract_dir}"/*)
+          shopt -u nullglob dotglob
+          if [[ ${#entries[@]} -eq 1 && -d "${entries[0]}" ]]; then
+            extract_dir="${entries[0]}"
+          fi
+
+          rm -rf "${extract_dir}/.github"
+
+          cp -a "${extract_dir}/." "${GITHUB_WORKSPACE}/"
+
+          if [[ ! -f "${GITHUB_WORKSPACE}/settings.gradle.kts" && ! -f "${GITHUB_WORKSPACE}/settings.gradle" ]]; then
+            echo "No settings.gradle(.kts) found at the project root after extracting the release source. Check the zip's contents/structure." >&2
+            exit 1
+          fi
 
       - name: Setup JDK
         uses: actions/setup-java@v5
@@ -174,13 +212,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
           RELEASE_TITLE: ${{ steps.meta.outputs.release_title }}
+          SOURCE_TAG: ${{ steps.meta.outputs.source_tag }}
         shell: bash
         run: |
           set -euo pipefail
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release edit "${RELEASE_TAG}" --title "${RELEASE_TITLE}" --notes "Rebuilt explicitly by workflow run ${GITHUB_RUN_NUMBER} from source ${GITHUB_SHA}."
-            gh release upload "${RELEASE_TAG}" app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/app-release.apk.sha256 --clobber
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --title "${RELEASE_TITLE}" --notes "Rebuilt explicitly by workflow run ${GITHUB_RUN_NUMBER} from source release ${SOURCE_TAG}."
+            gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/app-release.apk.sha256 --clobber
           else
-            gh release create "${RELEASE_TAG}" app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/app-release.apk.sha256 --title "${RELEASE_TITLE}" --generate-notes
+            gh release create "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/app-release.apk.sha256 --title "${RELEASE_TITLE}" --generate-notes
           fi
-          

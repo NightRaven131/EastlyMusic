@@ -1,0 +1,186 @@
+name: Build Eastly APK
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build/publish. Blank = build latest release source as a non-release artifact."
+        required: false
+        type: string
+      title:
+        description: "Release title. Used only when a tag is explicitly built/published."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  JAVA_VERSION: "17"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Initial checkout for metadata
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve build source, version, and release policy
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_TITLE: ${{ inputs.title }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          latest_release="$(gh release list --limit 1 --json tagName,name --jq '.[0].tagName' || true)"
+
+          publish=false
+          source_ref="${GITHUB_SHA}"
+          target_tag=""
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            source_ref="${GITHUB_REF_NAME}"
+            target_tag="${GITHUB_REF_NAME}"
+            publish=true
+          elif [[ -n "${INPUT_TAG}" ]]; then
+            target_tag="${INPUT_TAG#refs/tags/}"
+            [[ "${target_tag}" == v* ]] || target_tag="v${target_tag}"
+            git rev-parse --verify "refs/tags/${target_tag}" >/dev/null 2>&1 || { echo "Requested tag ${target_tag} does not exist." >&2; exit 1; }
+            source_ref="${target_tag}"
+            publish=true
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${latest_release}" ]]; then
+            source_ref="${latest_release}"
+          fi
+
+          if [[ -n "${target_tag}" ]]; then
+            version_name="${target_tag#v}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_TYPE}" == "branch" ]]; then
+            base="${latest_release#v}"
+            [[ -n "${base}" ]] || base="0.0.0"
+            version_name="${base}-main.${GITHUB_RUN_NUMBER}"
+          elif [[ -n "${latest_release}" ]]; then
+            version_name="${latest_release#v}-rebuild.${GITHUB_RUN_NUMBER}"
+          else
+            version_name="0.0.0-dev.${GITHUB_RUN_NUMBER}"
+          fi
+
+          # CI run numbers are globally monotonic within this repository. The low digit
+          # identifies build kind while the run number guarantees unique Android versionCode values.
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            channel=9
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            channel=5
+          else
+            channel=1
+          fi
+          version_code=$(( GITHUB_RUN_NUMBER * 10 + channel ))
+          if (( version_code < 1 || version_code > 2147483647 )); then
+            echo "Computed versionCode ${version_code} is outside Android's supported range." >&2
+            exit 1
+          fi
+
+          release_title="${INPUT_TITLE:-}"
+          if [[ -z "${release_title}" && -n "${target_tag}" ]]; then
+            release_title="Eastly ${target_tag#v}"
+          fi
+          [[ -n "${release_title}" ]] || release_title="Eastly ${version_name}"
+
+          {
+            echo "source_ref=${source_ref}"
+            echo "release_tag=${target_tag}"
+            echo "version_name=${version_name}"
+            echo "version_code=${version_code}"
+            echo "publish=${publish}"
+            echo "release_title<<EOF"
+            echo "${release_title}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout resolved build source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.meta.outputs.source_ref }}
+          fetch-depth: 0
+
+      - name: Setup JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Generate standard Gradle Wrapper
+        run: gradle --no-daemon wrapper --gradle-version 9.7.1 --distribution-type bin
+
+      - name: Make Gradle launcher executable
+        run: chmod +x ./gradlew
+
+      - name: Test, lint, and build release APK
+        env:
+          EASTLY_VERSION_NAME: ${{ steps.meta.outputs.version_name }}
+          EASTLY_VERSION_CODE: ${{ steps.meta.outputs.version_code }}
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --stacktrace clean test lintDebug assembleRelease \
+            -PeastlyVersionName="${EASTLY_VERSION_NAME}" \
+            -PeastlyVersionCode="${EASTLY_VERSION_CODE}"
+
+      - name: Verify APK metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="app/build/outputs/apk/release/app-release.apk"
+          test -s "$APK"
+          AAPT="$(find "${ANDROID_HOME}/build-tools" -type f -name aapt | sort -V | tail -n 1)"
+          test -x "$AAPT"
+          BADGING="$($AAPT dump badging "$APK")"
+          echo "$BADGING" | grep -F "versionCode='${{ steps.meta.outputs.version_code }}'"
+          echo "$BADGING" | grep -F "versionName='${{ steps.meta.outputs.version_name }}'"
+          sha256sum "$APK" | tee "${APK}.sha256"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Eastly-${{ steps.meta.outputs.version_name }}-${{ github.sha }}
+          path: |
+            app/build/outputs/apk/release/app-release.apk
+            app/build/outputs/apk/release/app-release.apk.sha256
+          if-no-files-found: error
+
+      - name: Publish release only for a tag release run
+        if: steps.meta.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+          RELEASE_TITLE: ${{ steps.meta.outputs.release_title }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" --title "${RELEASE_TITLE}" --notes "Rebuilt explicitly by workflow run ${GITHUB_RUN_NUMBER} from source ${GITHUB_SHA}."
+            gh release upload "${RELEASE_TAG}" app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/app-release.apk.sha256 --clobber
+          else
+            gh release create "${RELEASE_TAG}" app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/app-release.apk.sha256 --title "${RELEASE_TITLE}" --generate-notes
+          fi
+          

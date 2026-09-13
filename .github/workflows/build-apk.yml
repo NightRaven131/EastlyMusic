@@ -169,7 +169,7 @@ jobs:
         run: |
           set -euo pipefail
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-37" "build-tools;36.0.0"
+          sdkmanager "platforms;android-37.0" "build-tools;36.0.0"
 
       - name: Generate standard Gradle Wrapper
         run: gradle --no-daemon wrapper --gradle-version ${{ env.GRADLE_VERSION }} --distribution-type bin

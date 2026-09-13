@@ -20,6 +20,7 @@ permissions:
 
 env:
   JAVA_VERSION: "17"
+  GRADLE_VERSION: "9.7.1"
 
 jobs:
   build:
@@ -160,6 +161,8 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
 
       - name: Install Android SDK packages
         shell: bash
@@ -169,7 +172,7 @@ jobs:
           sdkmanager "platforms;android-36" "build-tools;36.0.0"
 
       - name: Generate standard Gradle Wrapper
-        run: gradle --no-daemon wrapper --gradle-version 9.7.1 --distribution-type bin
+        run: gradle --no-daemon wrapper --gradle-version ${{ env.GRADLE_VERSION }} --distribution-type bin
 
       - name: Make Gradle launcher executable
         run: chmod +x ./gradlew

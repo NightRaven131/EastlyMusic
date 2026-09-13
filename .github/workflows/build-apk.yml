@@ -2,20 +2,25 @@ name: Build Eastly APK
 
 on:
   push:
-    branches: ["main"]
-    tags: ["v*"]
+    branches:
+      - main
+    tags:
+      - "v*"
+
   workflow_dispatch:
     inputs:
       tag:
         description: "Existing release tag to build from. Blank = latest release."
         required: false
         type: string
+
       source_asset:
-        description: "Optional exact source ZIP asset name. Blank = auto-detect a source ZIP."
+        description: "Exact source ZIP asset name. Blank = auto-detect source ZIP."
         required: false
         type: string
+
       title:
-        description: "Release title. Used only when a tag is explicitly built/published."
+        description: "Release title. Used only when publishing a tag release."
         required: false
         type: string
 
@@ -25,83 +30,116 @@ permissions:
 env:
   JAVA_VERSION: "17"
   GRADLE_VERSION: "9.7.1"
+  ANDROID_PLATFORM: "37"
+  ANDROID_BUILD_TOOLS: "36.0.0"
 
 jobs:
   build:
+    name: Build Eastly APK
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Resolve source release, version, and release policy
+      - name: Resolve source release and build metadata
         id: meta
         env:
+          GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_TITLE: ${{ inputs.title }}
-          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
 
-          latest_release="$(gh release list \
-            --repo "${GITHUB_REPOSITORY}" \
-            --limit 1 \
-            --json tagName \
-            --jq '.[0].tagName // empty' || true)"
+          echo "Repository: ${GITHUB_REPOSITORY}"
+          echo "Event: ${GITHUB_EVENT_NAME}"
+          echo "Ref: ${GITHUB_REF}"
 
-          publish=false
+          latest_release="$(
+            gh release list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --limit 1 \
+              --json tagName \
+              --jq '.[0].tagName // empty'
+          )"
+
+          publish="false"
           source_tag=""
           target_tag=""
 
           if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            source_tag="${GITHUB_REF_NAME}"
             target_tag="${GITHUB_REF_NAME}"
-            source_tag="${target_tag}"
-            publish=true
+            publish="true"
+
           elif [[ -n "${INPUT_TAG}" ]]; then
             target_tag="${INPUT_TAG#refs/tags/}"
-            [[ "${target_tag}" == v* ]] || target_tag="v${target_tag}"
+
+            if [[ "${target_tag}" != v* ]]; then
+              target_tag="v${target_tag}"
+            fi
+
             source_tag="${target_tag}"
-            publish=true
+            publish="true"
+
           elif [[ -n "${latest_release}" ]]; then
             source_tag="${latest_release}"
+
           else
-            echo "No release exists yet. Create a release with the source ZIP attached." >&2
+            echo "::error::No GitHub release exists."
+            echo "Create a release and attach the Eastly source ZIP first."
             exit 1
           fi
 
-          gh release view "${source_tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 || {
-            echo "Release '${source_tag}' was not found." >&2
+          echo "Source release: ${source_tag}"
+
+          if ! gh release view "${source_tag}" \
+            --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+
+            echo "::error::Release '${source_tag}' does not exist."
             exit 1
-          }
+          fi
 
           if [[ -n "${target_tag}" ]]; then
             version_name="${target_tag#v}"
+
           elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
             version_name="${source_tag#v}-main.${GITHUB_RUN_NUMBER}"
+
           else
             version_name="${source_tag#v}-rebuild.${GITHUB_RUN_NUMBER}"
           fi
 
+          case "${GITHUB_EVENT_NAME}" in
+            workflow_dispatch)
+              channel=5
+              ;;
+            *)
+              channel=1
+              ;;
+          esac
+
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             channel=9
-          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            channel=5
-          else
-            channel=1
           fi
 
-          version_code=$(( GITHUB_RUN_NUMBER * 10 + channel ))
+          version_code=$((GITHUB_RUN_NUMBER * 10 + channel))
+
           if (( version_code < 1 || version_code > 2147483647 )); then
-            echo "Computed versionCode ${version_code} is outside Android's supported range." >&2
+            echo "::error::Computed versionCode '${version_code}' is outside Android's valid range."
             exit 1
           fi
 
           release_title="${INPUT_TITLE:-}"
+
           if [[ -z "${release_title}" && -n "${target_tag}" ]]; then
             release_title="Eastly ${target_tag#v}"
           fi
-          [[ -n "${release_title}" ]] || release_title="Eastly ${version_name}"
+
+          if [[ -z "${release_title}" ]]; then
+            release_title="Eastly ${version_name}"
+          fi
 
           {
             echo "source_tag=${source_tag}"
@@ -112,9 +150,10 @@ jobs:
             echo "release_title<<EOF"
             echo "${release_title}"
             echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          } >> "${GITHUB_OUTPUT}"
 
-      - name: Download and extract source from release
+      - name: Download source ZIP
+        id: source
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_TAG: ${{ steps.meta.outputs.source_tag }}
@@ -123,16 +162,37 @@ jobs:
         run: |
           set -euo pipefail
 
-          download_dir="$(mktemp -d)"
+          download_dir="${RUNNER_TEMP}/eastly-source"
+          rm -rf "${download_dir}"
+          mkdir -p "${download_dir}"
 
           if [[ -n "${SOURCE_ASSET}" ]]; then
-            echo "Downloading explicitly selected source asset: ${SOURCE_ASSET}"
+            echo "Using explicitly selected source asset:"
+            echo "  ${SOURCE_ASSET}"
+
             gh release download "${SOURCE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
               --pattern "${SOURCE_ASSET}" \
               --dir "${download_dir}"
+
+            shopt -s nullglob
+            selected_files=("${download_dir}"/*)
+            shopt -u nullglob
+
+            if (( ${#selected_files[@]} != 1 )); then
+              echo "::error::Expected exactly one downloaded source asset."
+              printf 'Found:\n'
+              printf ' - %s\n' "${selected_files[@]##*/}"
+              exit 1
+            fi
+
+            cp -f \
+              "${selected_files[0]}" \
+              "${download_dir}/selected-source.zip"
+
           else
-            echo "Auto-detecting source ZIP from release '${SOURCE_TAG}'..."
+            echo "Auto-detecting source ZIP..."
+
             gh release download "${SOURCE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
               --pattern "*.zip" \
@@ -142,51 +202,110 @@ jobs:
             all_zips=("${download_dir}"/*.zip)
             shopt -u nullglob
 
+            if (( ${#all_zips[@]} == 0 )); then
+              echo "::error::No ZIP asset found in release '${SOURCE_TAG}'."
+              exit 1
+            fi
+
             source_zips=()
+
             for zip in "${all_zips[@]}"; do
-              base="$(basename "$zip")"
-              if [[ "$base" =~ [Ss]ource|[Ss]rc ]]; then
-                source_zips+=("$zip")
+              base="$(basename "${zip}")"
+
+              if [[ "${base}" =~ [Ss]ource|[Ss]rc ]]; then
+                source_zips+=("${zip}")
               fi
             done
 
-            if [[ ${#source_zips[@]} -eq 1 ]]; then
-              cp -f "${source_zips[0]}" "${download_dir}/selected-source.zip"
-            elif [[ ${#all_zips[@]} -eq 1 ]]; then
-              cp -f "${all_zips[0]}" "${download_dir}/selected-source.zip"
+            if (( ${#source_zips[@]} == 1 )); then
+              selected="${source_zips[0]}"
+
+            elif (( ${#source_zips[@]} > 1 )); then
+              echo "::error::Multiple possible source ZIPs found."
+              printf 'Source candidates:\n'
+              printf ' - %s\n' "${source_zips[@]##*/}"
+              echo "Set workflow_dispatch input 'source_asset' explicitly."
+              exit 1
+
+            elif (( ${#all_zips[@]} == 1 )); then
+              selected="${all_zips[0]}"
+
             else
-              echo "Could not uniquely identify the source ZIP on release '${SOURCE_TAG}'." >&2
-              echo "ZIP assets found:" >&2
-              printf ' - %s\n' "${all_zips[@]##*/}" >&2
-              echo "Set the workflow_dispatch input 'source_asset' to the exact source ZIP name." >&2
+              echo "::error::Could not uniquely identify the source ZIP."
+              printf 'ZIP assets found:\n'
+              printf ' - %s\n' "${all_zips[@]##*/}"
+              echo "Set workflow_dispatch input 'source_asset' explicitly."
               exit 1
             fi
+
+            cp -f \
+              "${selected}" \
+              "${download_dir}/selected-source.zip"
+
+            echo "Selected:"
+            echo "  $(basename "${selected}")"
           fi
 
-          test -s "${download_dir}/selected-source.zip" || {
-            echo "Source ZIP was not downloaded." >&2
-            exit 1
-          }
+          test -s "${download_dir}/selected-source.zip"
 
-          extract_dir="$(mktemp -d)"
-          unzip -q "${download_dir}/selected-source.zip" -d "${extract_dir}"
+          echo "source_zip=${download_dir}/selected-source.zip" >> "${GITHUB_OUTPUT}"
+
+      - name: Prepare Android project
+        env:
+          SOURCE_ZIP: ${{ steps.source.outputs.source_zip }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          extract_dir="${RUNNER_TEMP}/eastly-project"
+
+          rm -rf "${extract_dir}"
+          mkdir -p "${extract_dir}"
+
+          unzip -q "${SOURCE_ZIP}" -d "${extract_dir}"
 
           shopt -s nullglob dotglob
           entries=("${extract_dir}"/*)
           shopt -u nullglob dotglob
 
-          if [[ ${#entries[@]} -eq 1 && -d "${entries[0]}" ]]; then
-            extract_dir="${entries[0]}"
+          if (( ${#entries[@]} == 1 && -d "${entries[0]}" )); then
+            project_root="${entries[0]}"
+          else
+            project_root="${extract_dir}"
           fi
 
-          rm -rf "${extract_dir}/.github"
-          cp -a "${extract_dir}/." "${GITHUB_WORKSPACE}/"
+          if [[ ! -f "${project_root}/settings.gradle.kts" &&
+                ! -f "${project_root}/settings.gradle" ]]; then
 
-          if [[ ! -f "${GITHUB_WORKSPACE}/settings.gradle.kts" && ! -f "${GITHUB_WORKSPACE}/settings.gradle" ]]; then
-            echo "No settings.gradle(.kts) found at the project root after extracting the release source." >&2
-            echo "The ZIP must contain the Android project itself (possibly inside one top-level folder)." >&2
+            echo "::error::No settings.gradle(.kts) found in extracted source."
+            echo "The ZIP must contain the Android/Gradle project."
             exit 1
           fi
+
+          rm -rf "${GITHUB_WORKSPACE}/.gradle"
+
+          find "${GITHUB_WORKSPACE}" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            ! -name ".git" \
+            ! -name "." \
+            ! -name ".." \
+            -exec rm -rf {} +
+
+          cp -a "${project_root}/." "${GITHUB_WORKSPACE}/"
+
+          rm -rf "${GITHUB_WORKSPACE}/.github"
+
+          echo "Project root:"
+          echo "${GITHUB_WORKSPACE}"
+
+          echo
+          echo "Top-level files:"
+          find "${GITHUB_WORKSPACE}" \
+            -maxdepth 2 \
+            -type f \
+            | sort \
+            | head -100
 
       - name: Setup JDK
         uses: actions/setup-java@v5
@@ -202,24 +321,110 @@ jobs:
         uses: gradle/actions/setup-gradle@v5
         with:
           gradle-version: ${{ env.GRADLE_VERSION }}
+          cache-read-only: false
+
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
 
       - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-37" "build-tools;36.0.0"
+
+          echo "Checking available SDK packages..."
+
+          sdkmanager --list | grep -E \
+            'platforms;android-37|platforms;android-36|build-tools;36' \
+            || true
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-${ANDROID_PLATFORM}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}"
+
+          echo
+          echo "Installed Android platforms:"
+          sdkmanager --list_installed | grep "platforms;" || true
+
+          echo
+          echo "Installed build-tools:"
+          sdkmanager --list_installed | grep "build-tools;" || true
+
+      - name: Validate Gradle project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f "./settings.gradle.kts" || \
+          test -f "./settings.gradle"
+
+          test -f "./build.gradle.kts" || \
+          test -f "./build.gradle"
+
+          test -f "./gradlew" || {
+            echo "::error::gradlew is missing from source ZIP."
+            exit 1
+          }
+
+          chmod +x "./gradlew"
+
+          echo "Gradle wrapper version:"
+          ./gradlew --version
 
       - name: Generate standard Gradle Wrapper
         shell: bash
         run: |
           set -euo pipefail
-          gradle --no-daemon wrapper \
+
+          gradle \
+            --no-daemon \
+            --stacktrace \
+            wrapper \
             --gradle-version "${GRADLE_VERSION}" \
             --distribution-type bin
-          chmod +x ./gradlew
 
-      - name: Test, lint, and build release APK
+          chmod +x "./gradlew"
+
+          echo "Generated wrapper:"
+          ./gradlew --version
+
+      - name: Print Android and Gradle environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Java:"
+          java -version
+
+          echo
+          echo "Gradle:"
+          ./gradlew --version
+
+          echo
+          echo "ANDROID_HOME=${ANDROID_HOME}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}"
+
+          echo
+          echo "Android SDK directories:"
+          find "${ANDROID_HOME}/platforms" \
+            -maxdepth 1 \
+            -mindepth 1 \
+            -type d \
+            | sort -V || true
+
+          echo
+          echo "Build tools:"
+          find "${ANDROID_HOME}/build-tools" \
+            -maxdepth 1 \
+            -mindepth 1 \
+            -type d \
+            | sort -V || true
+
+      - name: Test and build release APK
         env:
           EASTLY_VERSION_NAME: ${{ steps.meta.outputs.version_name }}
           EASTLY_VERSION_CODE: ${{ steps.meta.outputs.version_code }}
@@ -227,38 +432,117 @@ jobs:
         run: |
           set -euo pipefail
 
-          ./gradlew --no-daemon --stacktrace \
-            clean test lintDebug assembleRelease \
+          echo "versionName=${EASTLY_VERSION_NAME}"
+          echo "versionCode=${EASTLY_VERSION_CODE}"
+
+          ./gradlew \
+            --no-daemon \
+            --stacktrace \
+            --info \
+            clean \
+            test \
+            lintDebug \
+            assembleRelease \
             -PeastlyVersionName="${EASTLY_VERSION_NAME}" \
             -PeastlyVersionCode="${EASTLY_VERSION_CODE}"
 
-      - name: Verify APK metadata
+      - name: Locate release APK
+        id: apk
         shell: bash
         run: |
           set -euo pipefail
 
-          APK="app/build/outputs/apk/release/app-release.apk"
-          test -s "$APK"
+          apk_candidates=()
 
-          AAPT="$(find "${ANDROID_HOME}/build-tools" -type f -name aapt | sort -V | tail -n 1)"
-          test -x "$AAPT"
+          while IFS= read -r -d '' apk; do
+            apk_candidates+=("${apk}")
+          done < <(
+            find "${GITHUB_WORKSPACE}/app/build/outputs/apk/release" \
+              -type f \
+              -name "*.apk" \
+              -print0
+          )
 
-          BADGING="$($AAPT dump badging "$APK")"
-          echo "$BADGING" | grep -F "versionCode='${{ steps.meta.outputs.version_code }}'"
-          echo "$BADGING" | grep -F "versionName='${{ steps.meta.outputs.version_name }}'"
+          if (( ${#apk_candidates[@]} != 1 )); then
+            echo "::error::Expected exactly one release APK."
 
-          sha256sum "$APK" | tee "${APK}.sha256"
+            if (( ${#apk_candidates[@]} > 0 )); then
+              printf 'Found:\n'
+              printf ' - %s\n' "${apk_candidates[@]}"
+            fi
+
+            exit 1
+          fi
+
+          apk="${apk_candidates[0]}"
+
+          echo "APK found:"
+          echo "${apk}"
+
+          mkdir -p "${GITHUB_WORKSPACE}/release-output"
+
+          cp -f \
+            "${apk}" \
+            "${GITHUB_WORKSPACE}/release-output/Eastly-release.apk"
+
+          echo "path=${GITHUB_WORKSPACE}/release-output/Eastly-release.apk" \
+            >> "${GITHUB_OUTPUT}"
+
+      - name: Verify APK metadata
+        env:
+          APK_PATH: ${{ steps.apk.outputs.path }}
+          EXPECTED_VERSION_NAME: ${{ steps.meta.outputs.version_name }}
+          EXPECTED_VERSION_CODE: ${{ steps.meta.outputs.version_code }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s "${APK_PATH}"
+
+          AAPT2="$(
+            find "${ANDROID_HOME}/build-tools" \
+              -type f \
+              -name "aapt2" \
+              -perm -111 \
+              | sort -V \
+              | tail -n 1
+          )"
+
+          if [[ -z "${AAPT2}" ]]; then
+            echo "::error::aapt2 was not found."
+            exit 1
+          fi
+
+          echo "Using aapt2:"
+          echo "${AAPT2}"
+
+          "${AAPT2}" dump badging "${APK_PATH}" \
+            > "${RUNNER_TEMP}/eastly-badging.txt"
+
+          cat "${RUNNER_TEMP}/eastly-badging.txt"
+
+          grep -F \
+            "versionCode='${EXPECTED_VERSION_CODE}'" \
+            "${RUNNER_TEMP}/eastly-badging.txt"
+
+          grep -F \
+            "versionName='${EXPECTED_VERSION_NAME}'" \
+            "${RUNNER_TEMP}/eastly-badging.txt"
+
+          sha256sum "${APK_PATH}" \
+            | tee "${APK_PATH}.sha256"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: Eastly-${{ steps.meta.outputs.version_name }}-${{ github.sha }}
-          path: |
-            app/build/outputs/apk/release/app-release.apk
-            app/build/outputs/apk/release/app-release.apk.sha256
           if-no-files-found: error
+          retention-days: 30
+          path: |
+            release-output/Eastly-release.apk
+            release-output/Eastly-release.apk.sha256
 
-      - name: Publish release only for a tag release run
+      - name: Publish APK to release
         if: steps.meta.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -269,23 +553,56 @@ jobs:
         run: |
           set -euo pipefail
 
-          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+          APK="release-output/Eastly-release.apk"
+          SHA="release-output/Eastly-release.apk.sha256"
+
+          test -s "${APK}"
+          test -s "${SHA}"
+
+          if gh release view "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+
             gh release edit "${RELEASE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
               --title "${RELEASE_TITLE}" \
-              --notes "Rebuilt by workflow run ${GITHUB_RUN_NUMBER} from source release ${SOURCE_TAG}."
+              --notes \
+              "Built by GitHub Actions run ${GITHUB_RUN_NUMBER}. Source release: ${SOURCE_TAG}."
 
             gh release upload "${RELEASE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
-              app/build/outputs/apk/release/app-release.apk \
-              app/build/outputs/apk/release/app-release.apk.sha256 \
+              "${APK}" \
+              "${SHA}" \
               --clobber
+
           else
+
             gh release create "${RELEASE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
-              app/build/outputs/apk/release/app-release.apk \
-              app/build/outputs/apk/release/app-release.apk.sha256 \
+              "${APK}" \
+              "${SHA}" \
               --title "${RELEASE_TITLE}" \
               --generate-notes
+
           fi
-          
+
+      - name: Build summary
+        if: always()
+        env:
+          SOURCE_TAG: ${{ steps.meta.outputs.source_tag }}
+          VERSION_NAME: ${{ steps.meta.outputs.version_name }}
+          VERSION_CODE: ${{ steps.meta.outputs.version_code }}
+        shell: bash
+        run: |
+          {
+            echo "## Eastly Build"
+            echo
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Source release | \`${SOURCE_TAG:-unknown}\` |"
+            echo "| Version name | \`${VERSION_NAME:-unknown}\` |"
+            echo "| Version code | \`${VERSION_CODE:-unknown}\` |"
+            echo "| Java | \`${JAVA_VERSION}\` |"
+            echo "| Gradle | \`${GRADLE_VERSION}\` |"
+            echo "| Android API | \`${ANDROID_PLATFORM}\` |"
+            echo "| Build tools | \`${ANDROID_BUILD_TOOLS}\` |"
+          } >> "${GITHUB_STEP_SUMMARY}"

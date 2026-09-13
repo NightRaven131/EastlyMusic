@@ -141,7 +141,6 @@ jobs:
           fi
 
           rm -rf "${extract_dir}/.github"
-
           cp -a "${extract_dir}/." "${GITHUB_WORKSPACE}/"
 
           if [[ ! -f "${GITHUB_WORKSPACE}/settings.gradle.kts" && ! -f "${GITHUB_WORKSPACE}/settings.gradle" ]]; then
@@ -157,7 +156,7 @@ jobs:
           cache: gradle
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v5
@@ -225,3 +224,4 @@ jobs:
           else
             gh release create "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" app/build/outputs/apk/release/app-release.apk app/build/outputs/apk/release/app-release.apk.sha256 --title "${RELEASE_TITLE}" --generate-notes
           fi
+          

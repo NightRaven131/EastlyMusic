@@ -1,0 +1,231 @@
+name: Build EastlyMusic APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: "GitHub Release tag containing the source ZIP"
+        required: true
+        default: "V17"
+      source_asset:
+        description: "Release asset filename"
+        required: true
+        default: "Eastly.zip"
+      publish_release:
+        description: "Upload APK to the source release"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: eastlymusic-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      JAVA_VERSION: "17"
+      GRADLE_VERSION: "9.7.1"
+      ANDROID_API: "37"
+      EASTLY_VERSION_NAME: "V17-rebuild.4"
+      EASTLY_VERSION_CODE: "36"
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v5
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sdkmanager --list > sdkmanager-list.txt 2>&1 || true
+
+          platform=""
+          if grep -q 'platforms;android-37\.0' sdkmanager-list.txt; then
+            platform="platforms;android-37.0"
+          elif grep -q 'platforms;android-37' sdkmanager-list.txt; then
+            platform="platforms;android-37"
+          fi
+
+          if [[ -z "$platform" ]]; then
+            echo "::error::Android API 37 platform was not found in sdkmanager."
+            exit 1
+          fi
+
+          yes | sdkmanager \
+            "$platform" \
+            "build-tools;36.0.0" \
+            "platform-tools"
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+      - name: Download source ZIP from GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_ASSET: ${{ inputs.source_asset }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -f selected-source.zip source.zip
+
+          gh release download "$SOURCE_TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "$SOURCE_ASSET" \
+            --clobber \
+            --output selected-source.zip
+
+          test -s selected-source.zip
+
+          echo "Downloaded source asset:"
+          ls -lh selected-source.zip
+          unzip -l selected-source.zip | head -80
+
+      - name: Extract Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf extracted
+          mkdir -p extracted
+          unzip -q selected-source.zip -d extracted
+
+          mapfile -t entries < <(find extracted -mindepth 1 -maxdepth 1 -printf '%p\n')
+
+          if (( ${#entries[@]} == 1 )) && [[ -d "${entries[0]}" ]]; then
+            PROJECT_ROOT="${entries[0]}"
+          else
+            PROJECT_ROOT="extracted"
+          fi
+
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+
+          echo "Project root: $PROJECT_ROOT"
+          find "$PROJECT_ROOT" -maxdepth 2 -type f \
+            \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \
+               -o -name 'build.gradle' -o -name 'build.gradle.kts' \
+               -o -name 'gradle-wrapper.properties' \) -print
+
+      - name: Verify Android project
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f settings.gradle || test -f settings.gradle.kts
+          test -f build.gradle || test -f build.gradle.kts
+          test -d app
+
+      - name: Generate Gradle wrapper
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gradle wrapper \
+            --gradle-version "${GRADLE_VERSION}" \
+            --distribution-type bin
+
+          chmod +x ./gradlew
+          ./gradlew --version
+
+      - name: Build release APK
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ./gradlew \
+            clean \
+            test \
+            assembleRelease \
+            --stacktrace \
+            -PeastlyVersionName="${EASTLY_VERSION_NAME}" \
+            -PeastlyVersionCode="${EASTLY_VERSION_CODE}" \
+            -x lint \
+            -x lintDebug \
+            -x lintRelease \
+            -x lintVitalAnalyzeRelease \
+            -x lintVitalRelease
+
+      - name: Collect APK
+        working-directory: ${{ env.PROJECT_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+
+          mapfile -t apks < <(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*.apk' -print)
+
+          if (( ${#apks[@]} == 0 )); then
+            echo "::error::No release APK was produced."
+            find app/build/outputs -type f -maxdepth 5 -print 2>/dev/null || true
+            exit 1
+          fi
+
+          for apk in "${apks[@]}"; do
+            cp "$apk" "$GITHUB_WORKSPACE/artifacts/$(basename "$apk")"
+          done
+
+          ls -lah "$GITHUB_WORKSPACE/artifacts"
+
+      - name: Upload APK as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EastlyMusic-release-apk
+          path: artifacts/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload APK to GitHub Release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release upload "$SOURCE_TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            artifacts/*.apk \
+            --clobber
+
+      - name: Build summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## EastlyMusic APK Build"
+            echo
+            echo "- Release: \`${{ inputs.source_tag }}\`"
+            echo "- Source asset: \`${{ inputs.source_asset }}\`"
+            echo "- Java: \`${JAVA_VERSION}\`"
+            echo "- Gradle: \`${GRADLE_VERSION}\`"
+            echo "- Android API: \`${ANDROID_API}\`"
+            echo
+            echo "### APK files"
+            if [[ -d artifacts ]]; then
+              find artifacts -maxdepth 1 -type f -name '*.apk' -printf '%f\n' | sed 's/^/- /' || true
+            else
+              echo "- none"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

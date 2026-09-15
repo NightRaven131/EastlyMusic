@@ -1,0 +1,219 @@
+name: Build EastlyMusic APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: "Release tag containing the source ZIP when the repo root is not an Android project"
+        required: true
+        default: "V19"
+      source_asset:
+        description: "Release asset filename"
+        required: true
+        default: "Eastly.zip"
+      publish_release:
+        description: "Upload APK to the source release"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: eastlymusic-build
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: "17"
+  GRADLE_VERSION: "9.7.1"
+  ANDROID_API: "37"
+  BUILD_TOOLS: "36.0.0"
+  EASTLY_VERSION_NAME: "V19-brutal-fixed"
+  EASTLY_VERSION_CODE: "38"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Resolve Android project
+        id: project
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_ASSET: ${{ inputs.source_asset }}
+        run: |
+          set -euo pipefail
+
+          if [[ -f settings.gradle.kts && -d app ]]; then
+            echo "root=." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          candidate=""
+          while IFS= read -r dir; do
+            if [[ -f "$dir/settings.gradle.kts" && -d "$dir/app" ]]; then
+              candidate="$dir"
+              break
+            fi
+          done < <(find . -maxdepth 3 -type d -name eastly-fixed -o -name eastly-v18 | sort)
+
+          if [[ -n "$candidate" ]]; then
+            echo "root=$candidate" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          rm -f selected-source.zip
+          gh release download "$SOURCE_TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "$SOURCE_ASSET" \
+            --clobber \
+            --output selected-source.zip
+          test -s selected-source.zip
+
+          rm -rf extracted-source
+          mkdir extracted-source
+          unzip -q selected-source.zip -d extracted-source
+
+          candidate=""
+          while IFS= read -r settings; do
+            dir="$(dirname "$settings")"
+            if [[ -d "$dir/app" ]]; then
+              candidate="$dir"
+              break
+            fi
+          done < <(find extracted-source -type f \( -name settings.gradle.kts -o -name settings.gradle \) | sort)
+
+          if [[ -z "$candidate" ]]; then
+            echo "No Android project was found in the repository or release asset."
+            exit 1
+          fi
+
+          echo "root=$candidate" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          (yes || true) | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          sdkmanager --list > sdkmanager-list.txt 2>&1 || true
+
+          platform=""
+          if grep -q "platforms;android-${ANDROID_API}\.0" sdkmanager-list.txt; then
+            platform="platforms;android-${ANDROID_API}.0"
+          elif grep -q "platforms;android-${ANDROID_API}$" sdkmanager-list.txt; then
+            platform="platforms;android-${ANDROID_API}"
+          fi
+
+          if [[ -z "$platform" ]]; then
+            echo "::error::Android API ${ANDROID_API} platform was not found in sdkmanager."
+            exit 1
+          fi
+
+          sdkmanager \
+            "$platform" \
+            "build-tools;${BUILD_TOOLS}" \
+            "platform-tools"
+
+      - name: Generate Gradle wrapper when missing
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f gradle/wrapper/gradle-wrapper.jar ]]; then
+            gradle wrapper --gradle-version "${GRADLE_VERSION}" --distribution-type bin
+          fi
+          chmod +x ./gradlew
+          ./gradlew --version
+
+      - name: Build and test
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew clean test assembleRelease \
+            --stacktrace \
+            -PeastlyVersionName="${EASTLY_VERSION_NAME}" \
+            -PeastlyVersionCode="${EASTLY_VERSION_CODE}" \
+            -x lint \
+            -x lintDebug \
+            -x lintRelease \
+            -x lintVitalAnalyzeRelease \
+            -x lintVitalRelease
+
+      - name: Sign release APK
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          keystore="$RUNNER_TEMP/eastly-release.keystore"
+          keytool -genkeypair -v \
+            -keystore "$keystore" \
+            -storepass "eastlybuild" \
+            -alias eastly \
+            -keypass "eastlybuild" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=EastlyMusic, OU=CI, O=EastlyMusic, L=Unknown, S=Unknown, C=US"
+
+          mapfile -t unsigned < <(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*-unsigned.apk' -print)
+          if (( ${#unsigned[@]} == 0 )); then
+            echo "No unsigned release APK was produced."
+            find app/build/outputs -type f -maxdepth 5 -print 2>/dev/null || true
+            exit 1
+          fi
+
+          for apk in "${unsigned[@]}"; do
+            signed="${apk%-unsigned.apk}-signed.apk"
+            "$ANDROID_HOME/build-tools/${BUILD_TOOLS}/apksigner" sign \
+              --ks "$keystore" \
+              --ks-pass pass:eastlybuild \
+              --key-pass pass:eastlybuild \
+              --out "$signed" \
+              "$apk"
+            "$ANDROID_HOME/build-tools/${BUILD_TOOLS}/apksigner" verify "$signed"
+          done
+
+      - name: Collect artifact
+        working-directory: ${{ steps.project.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp app/build/outputs/apk/release/*-signed.apk "$GITHUB_WORKSPACE/artifacts/EastlyMusic-V19-signed.apk"
+          sha256sum "$GITHUB_WORKSPACE/artifacts/EastlyMusic-V19-signed.apk" | tee "$GITHUB_WORKSPACE/artifacts/SHA256SUMS.txt"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EastlyMusic-V19
+          path: artifacts/
+          if-no-files-found: error
+
+      - name: Publish APK to release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.source_tag }}
+          files: artifacts/EastlyMusic-V19-signed.apk
+          fail_on_unmatched_files: true
